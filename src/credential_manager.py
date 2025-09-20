@@ -3,6 +3,7 @@
 """
 import asyncio
 import time
+import random
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple
 from contextlib import asynccontextmanager
@@ -27,9 +28,15 @@ class CredentialManager:
         
         # 凭证轮换相关
         self._credential_files: List[str] = []  # 存储凭证文件名列表
-        self._current_credential_index = 0
-        self._call_count = 0
         self._last_scan_time = 0
+        
+        # 回退模式相关
+        self._fallback_mode = False  # 是否处于回退模式（顺序调用）
+        self._fallback_index = 0  # 回退模式下的当前索引
+        self._random_failure_count = 0  # 随机模式连续失败次数
+        self._fallback_threshold = 3  # 连续失败多少次后回退到顺序模式
+        self._recovery_attempt_count = 0  # 恢复尝试次数
+        self._recovery_threshold = 10  # 每尝试多少次检查一次是否可以恢复随机模式
         
         # 当前使用的凭证信息
         self._current_credential_file: Optional[str] = None
@@ -175,10 +182,6 @@ class CredentialManager:
                     # 初始加载时只记录调试信息
                     if available_credentials:
                         log.debug(f"初始加载发现 {len(available_credentials)} 个可用凭证")
-                
-                # 重置当前索引如果需要
-                if self._current_credential_index >= len(self._credential_files):
-                    self._current_credential_index = 0
             
             if not self._credential_files:
                 log.warning("No available credential files found")
@@ -190,11 +193,11 @@ class CredentialManager:
     
     async def _load_current_credential(self) -> Optional[Tuple[str, Dict[str, Any]]]:
         """加载当前选中的凭证数据，包含token过期检测和自动刷新"""
-        if not self._credential_files:
+        if not self._credential_files or not self._current_credential_file:
             return None
         
         try:
-            current_file = self._credential_files[self._current_credential_index]
+            current_file = self._current_credential_file
             
             # 从存储适配器加载凭证数据
             credential_data = await self._storage_adapter.get_credential(current_file)
@@ -246,51 +249,120 @@ class CredentialManager:
             return None
     
     async def get_valid_credential(self) -> Optional[Tuple[str, Dict[str, Any]]]:
-        """获取有效的凭证，自动处理轮换和失效凭证切换"""
+        """获取有效的凭证，支持随机选择和顺序回退机制"""
         async with self._operation_lock:
             if not self._credential_files:
                 await self._discover_credentials()
                 if not self._credential_files:
                     return None
             
-            # 检查是否需要轮换
-            if await self._should_rotate():
-                await self._rotate_credential()
+            # 尝试恢复随机模式（如果处于回退模式）
+            await self._try_recover_from_fallback()
             
-            # 尝试获取有效凭证，如果失败则自动切换
-            max_attempts = len(self._credential_files)  # 最多尝试所有凭证
+            # 根据当前模式选择凭证
+            selected_credential = None
+            selection_error = None
+            
+            try:
+                if self._fallback_mode:
+                    # 回退模式：使用顺序选择
+                    selected_credential = self._select_credential_by_sequential()
+                    log.debug(f"回退模式选择凭证: {selected_credential}")
+                else:
+                    # 正常模式：使用随机选择
+                    selected_credential = await self._select_credential_by_weighted_random()
+                    log.debug(f"随机模式选择凭证: {selected_credential}")
+                    
+            except Exception as e:
+                selection_error = e
+                log.error(f"凭证选择失败: {e}")
+                self._random_failure_count += 1
+                
+                # 如果随机选择失败次数超过阈值，进入回退模式
+                if self._random_failure_count >= self._fallback_threshold:
+                    self._enter_fallback_mode()
+                    
+                    # 使用顺序选择作为回退
+                    try:
+                        selected_credential = self._select_credential_by_sequential()
+                        log.info(f"使用回退模式选择凭证: {selected_credential}")
+                    except Exception as fallback_error:
+                        log.error(f"回退模式选择也失败: {fallback_error}")
+                        return None
+            
+            if not selected_credential:
+                log.error("无法选择凭证")
+                return None
+            
+            # 尝试加载选中的凭证，如果失败则尝试其他凭证
+            max_attempts = len(self._credential_files)
+            attempted_credentials = set()
             
             for attempt in range(max_attempts):
                 try:
-                    # 加载当前凭证
+                    # 如果当前选择的凭证已经尝试过，重新选择
+                    if selected_credential in attempted_credentials:
+                        remaining_credentials = [c for c in self._credential_files if c not in attempted_credentials]
+                        if not remaining_credentials:
+                            break
+                        
+                        # 根据当前模式重新选择
+                        if self._fallback_mode:
+                            # 在回退模式下，直接从剩余凭证中按顺序选择
+                            selected_credential = remaining_credentials[0]
+                        else:
+                            # 在随机模式下，从剩余凭证中随机选择
+                            selected_credential = random.choice(remaining_credentials)
+                    
+                    attempted_credentials.add(selected_credential)
+                    
+                    # 设置当前凭证并尝试加载
+                    self._current_credential_file = selected_credential
                     result = await self._load_current_credential()
+                    
                     if result:
+                        # 成功加载，重置失败计数
+                        if not self._fallback_mode:
+                            self._random_failure_count = 0
+                        log.debug(f"成功选择并加载凭证: {selected_credential}")
                         return result
                     
-                    # 当前凭证加载失败，标记为失效并切换到下一个
-                    current_file = self._credential_files[self._current_credential_index] if self._credential_files else None
-                    if current_file:
-                        log.warning(f"凭证失效，自动禁用并切换: {current_file}")
-                        await self.set_cred_disabled(current_file, True)
+                    # 当前凭证加载失败，标记为失效
+                    log.warning(f"凭证失效，自动禁用: {selected_credential}")
+                    await self.set_cred_disabled(selected_credential, True)
+                    
+                    # 重新发现可用凭证（排除刚禁用的）
+                    await self._discover_credentials()
+                    if not self._credential_files:
+                        log.error("没有可用的凭证")
+                        return None
+                    
+                    # 如果没有剩余未尝试的凭证，退出
+                    remaining_credentials = [c for c in self._credential_files if c not in attempted_credentials]
+                    if not remaining_credentials:
+                        log.error("所有可用凭证都已尝试失败")
+                        break
                         
-                        # 重新发现可用凭证（排除刚禁用的）
-                        await self._discover_credentials()
-                        if not self._credential_files:
-                            log.error("没有可用的凭证")
-                            return None
+                    # 根据当前模式重新选择下一个凭证
+                    try:
+                        if self._fallback_mode:
+                            selected_credential = self._select_credential_by_sequential()
+                        else:
+                            selected_credential = await self._select_credential_by_weighted_random()
+                    except Exception as selection_retry_error:
+                        log.error(f"重新选择凭证失败: {selection_retry_error}")
+                        # 如果随机选择再次失败，强制进入回退模式
+                        if not self._fallback_mode:
+                            self._random_failure_count += 1
+                            if self._random_failure_count >= self._fallback_threshold:
+                                self._enter_fallback_mode()
+                                selected_credential = self._select_credential_by_sequential()
                         
-                        # 重置索引到第一个可用凭证
-                        self._current_credential_index = 0
-                        log.info(f"切换到下一个可用凭证 (索引: {self._current_credential_index})")
-                    else:
-                        log.error("无法获取当前凭证文件名")
+                    if not selected_credential:
                         break
                         
                 except Exception as e:
-                    log.error(f"获取凭证时发生异常 (尝试 {attempt + 1}/{max_attempts}): {e}")
-                    if attempt < max_attempts - 1:
-                        # 切换到下一个凭证继续尝试
-                        await self._rotate_credential()
+                    log.error(f"加载凭证时发生异常 {selected_credential} (尝试 {attempt + 1}/{max_attempts}): {e}")
                     continue
             
             log.error(f"所有 {max_attempts} 个凭证都尝试失败")
@@ -301,32 +373,209 @@ class CredentialManager:
         if not self._credential_files or len(self._credential_files) <= 1:
             return False
         
-        current_calls_per_rotation = await get_calls_per_rotation()
-        return self._call_count >= current_calls_per_rotation
-    
-    async def _rotate_credential(self):
-        """轮换到下一个凭证"""
-        if len(self._credential_files) <= 1:
-            return
-        
-        self._current_credential_index = (self._current_credential_index + 1) % len(self._credential_files)
-        self._call_count = 0
-        
-        log.info(f"Rotated to credential index {self._current_credential_index}")
+        # 注意：现在使用随机选择，不再需要基于调用次数的轮换检查
+        # 这个方法保留是为了兼容性，但总是返回False
+        return False
     
     async def force_rotate_credential(self):
-        """强制轮换到下一个凭证（用于429错误处理）"""
+        """强制选择新凭证（用于429错误处理）"""
         async with self._operation_lock:
             if len(self._credential_files) <= 1:
                 log.warning("Only one credential available, cannot rotate")
                 return
             
-            await self._rotate_credential()
+            # 简单地重新选择一个凭证（随机）
             log.info("Forced credential rotation due to rate limit")
     
+    async def _get_credential_usage_stats(self) -> Dict[str, int]:
+        """获取所有凭证的使用次数统计"""
+        usage_stats = {}
+        try:
+            # 获取所有凭证状态
+            all_states = await self._storage_adapter.get_all_credential_states()
+            
+            for credential_name in self._credential_files:
+                # 标准化文件名
+                normalized_name = credential_name
+                try:
+                    if (hasattr(self._storage_adapter, '_backend') and 
+                        hasattr(self._storage_adapter._backend, '_normalize_filename')):
+                        normalized_name = self._storage_adapter._backend._normalize_filename(credential_name)
+                except Exception:
+                    # 如果标准化失败，使用原文件名
+                    pass
+                
+                state = all_states.get(normalized_name, {})
+                usage_stats[credential_name] = state.get("usage_count", 0)
+                
+        except Exception as e:
+            log.warning(f"Failed to get usage stats, defaulting to 0: {e}")
+            # 如果获取失败，所有凭证使用次数都设为0
+            for credential_name in self._credential_files:
+                usage_stats[credential_name] = 0
+                
+        return usage_stats
+    
+    async def _select_credential_by_weighted_random(self) -> Optional[str]:
+        """基于使用次数的加权随机选择凭证，使用次数少的概率更高"""
+        if not self._credential_files:
+            return None
+            
+        if len(self._credential_files) == 1:
+            return self._credential_files[0]
+        
+        try:
+            # 获取使用统计
+            usage_stats = await self._get_credential_usage_stats()
+            
+            # 计算反向权重（使用次数少的权重高）
+            weights = []
+            max_usage = max(usage_stats.values()) if usage_stats.values() else 0
+            
+            for credential_name in self._credential_files:
+                usage_count = usage_stats.get(credential_name, 0)
+                # 反向权重：最大使用次数 - 当前使用次数 + 1
+                # 这样使用次数少的权重更高
+                weight = max_usage - usage_count + 1
+                weights.append(weight)
+            
+            # 确保权重有效
+            if not weights or all(w <= 0 for w in weights):
+                # 如果权重无效，给所有凭证相等权重
+                weights = [1] * len(self._credential_files)
+            
+            # 加权随机选择
+            selected_credential = random.choices(self._credential_files, weights=weights, k=1)[0]
+            
+            log.debug(f"加权随机选择凭证: {selected_credential}, 权重分布: {dict(zip(self._credential_files, weights))}")
+            return selected_credential
+            
+        except Exception as e:
+            log.error(f"加权随机选择失败，使用普通随机选择: {e}")
+            # 如果加权选择失败，回退到简单随机选择
+            return random.choice(self._credential_files)
+    
+    def _select_credential_by_sequential(self) -> Optional[str]:
+        """顺序选择凭证（回退模式）"""
+        if not self._credential_files:
+            return None
+            
+        if len(self._credential_files) == 1:
+            return self._credential_files[0]
+        
+        # 使用回退索引进行顺序选择
+        selected_credential = self._credential_files[self._fallback_index]
+        
+        # 更新索引，循环到下一个
+        self._fallback_index = (self._fallback_index + 1) % len(self._credential_files)
+        
+        log.debug(f"顺序选择凭证: {selected_credential} (索引: {self._fallback_index - 1})")
+        return selected_credential
+    
+    async def _try_recover_from_fallback(self) -> bool:
+        """尝试从回退模式恢复到随机模式"""
+        if not self._fallback_mode:
+            return True
+            
+        self._recovery_attempt_count += 1
+        
+        # 每达到恢复阈值次数，尝试一次随机选择
+        if self._recovery_attempt_count >= self._recovery_threshold:
+            self._recovery_attempt_count = 0
+            
+            try:
+                # 尝试一次随机选择
+                test_credential = await self._select_credential_by_weighted_random()
+                if test_credential:
+                    # 成功了，重置计数器并退出回退模式
+                    self._random_failure_count = 0
+                    self._fallback_mode = False
+                    log.info("成功从回退模式恢复到随机选择模式")
+                    return True
+            except Exception as e:
+                log.debug(f"恢复随机模式尝试失败: {e}")
+                
+        return False
+    
+    def _enter_fallback_mode(self):
+        """进入回退模式"""
+        if not self._fallback_mode:
+            self._fallback_mode = True
+            self._fallback_index = 0
+            self._recovery_attempt_count = 0
+            log.warning(f"随机选择连续失败 {self._random_failure_count} 次，进入顺序调用回退模式")
+    
+    async def increment_credential_usage(self, credential_name: str):
+        """增加指定凭证的使用计数"""
+        try:
+            current_state = await self._storage_adapter.get_credential_state(credential_name)
+            current_usage = current_state.get("usage_count", 0)
+            
+            await self.update_credential_state(credential_name, {
+                "usage_count": current_usage + 1,
+                "last_used": datetime.now(timezone.utc).isoformat()
+            })
+            
+            log.debug(f"凭证 {credential_name} 使用次数增加到: {current_usage + 1}")
+            
+        except Exception as e:
+            log.error(f"更新凭证使用次数失败 {credential_name}: {e}")
+    
     def increment_call_count(self):
-        """增加调用计数"""
-        self._call_count += 1
+        """增加调用计数 - 此方法现在仅用于兼容性，实际计数在increment_credential_usage中"""
+        log.debug(f"API调用完成")  # 仅记录调用，不再维护全局计数
+    
+    async def check_and_rotate_if_needed(self):
+        """检查并在需要时进行轮换（现在改为更新使用计数）"""
+        # 现在不再进行基于次数的轮换，而是更新当前凭证的使用计数
+        if self._current_credential_file:
+            await self.increment_credential_usage(self._current_credential_file)
+        return False
+    
+    def get_fallback_status(self) -> Dict[str, Any]:
+        """获取回退模式状态信息"""
+        return {
+            "is_fallback_mode": self._fallback_mode,
+            "fallback_index": self._fallback_index,
+            "random_failure_count": self._random_failure_count,
+            "fallback_threshold": self._fallback_threshold,
+            "recovery_attempt_count": self._recovery_attempt_count,
+            "recovery_threshold": self._recovery_threshold,
+            "total_credentials": len(self._credential_files),
+            "current_credential": self._current_credential_file
+        }
+    
+    def force_exit_fallback_mode(self):
+        """强制退出回退模式"""
+        if self._fallback_mode:
+            self._fallback_mode = False
+            self._random_failure_count = 0
+            self._recovery_attempt_count = 0
+            log.info("强制退出回退模式，恢复到随机选择模式")
+            return True
+        return False
+    
+    def force_enter_fallback_mode(self):
+        """强制进入回退模式"""
+        if not self._fallback_mode:
+            self._enter_fallback_mode()
+            return True
+        return False
+    
+    def configure_fallback_settings(self, fallback_threshold: int = None, recovery_threshold: int = None):
+        """配置回退模式参数"""
+        if fallback_threshold is not None:
+            self._fallback_threshold = max(1, fallback_threshold)
+            log.info(f"回退阈值设置为: {self._fallback_threshold}")
+        
+        if recovery_threshold is not None:
+            self._recovery_threshold = max(1, recovery_threshold)
+            log.info(f"恢复检查阈值设置为: {self._recovery_threshold}")
+        
+        return {
+            "fallback_threshold": self._fallback_threshold,
+            "recovery_threshold": self._recovery_threshold
+        }
     
     async def update_credential_state(self, credential_name: str, state_updates: Dict[str, Any]):
         """更新凭证状态"""
@@ -356,11 +605,10 @@ class CredentialManager:
             success = await self.update_credential_state(credential_name, state_updates)
             
             if success:
-                # 如果禁用了当前正在使用的凭证，需要重新发现可用凭证
+                # 如果禁用了当前正在使用的凭证，清除当前凭证
                 if disabled and credential_name == self._current_credential_file:
+                    self._current_credential_file = None
                     await self._discover_credentials()
-                    if self._credential_files:
-                        await self._rotate_credential()
                 
                 action = "disabled" if disabled else "enabled"
                 log.info(f"Credential {action}: {credential_name}")

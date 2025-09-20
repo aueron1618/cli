@@ -132,8 +132,9 @@ async def chat_completions(
     current_file = credential_result
     log.debug(f"Using credential: {current_file}")
     
-    # 增加调用计数
+    # 增加调用计数并检查是否需要轮换
     cred_mgr.increment_call_count()
+    await cred_mgr.check_and_rotate_if_needed()
     
     # 转换为Gemini API payload格式
     try:
