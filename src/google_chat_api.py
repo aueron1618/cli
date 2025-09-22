@@ -98,6 +98,7 @@ async def send_gemini_request(payload: dict, is_streaming: bool = False, credent
     Returns:
         FastAPI Response object
     """
+
     # 获取429重试配置
     max_retries = await get_retry_429_max_retries()
     retry_429_enabled = await get_retry_429_enabled()
@@ -113,19 +114,27 @@ async def send_gemini_request(payload: dict, is_streaming: bool = False, credent
     if not credential_manager:
         return _create_error_response("Credential manager not provided", 500)
     
-    # 获取当前凭证
+
+        # 获取当前凭证
     try:
+        # 首先获取凭证，如果获取失败，credential_exceeded_limit为False
+        credential_exceeded_limit = False
         credential_result = await credential_manager.get_valid_credential()
+
         if not credential_result:
+            credential_exceeded_limit = True
             return _create_error_response("No valid credentials available", 500)
         
         current_file, credential_data = credential_result
+
         headers, final_payload = await _prepare_request_headers_and_payload(payload, credential_data)
     except Exception as e:
         return _create_error_response(str(e), 500)
 
+
+
     # 预序列化payload，避免重试时重复序列化
-    final_post_data = json.dumps(final_payload)
+    final_post_data = json.dumps(final_payload, ensure_ascii=False)
     
     # Debug日志：打印请求体结构
     log.debug(f"Final request payload structure: {json.dumps(final_payload, ensure_ascii=False, indent=2)}")
@@ -160,6 +169,9 @@ async def send_gemini_request(payload: dict, is_streaming: bool = False, credent
                         if credential_manager and current_file:
                             await credential_manager.record_api_call_result(current_file, False, 429)
                         
+                            #记录失败，触发熔断
+                            await credential_manager.record_failure(current_file)
+
                         # 清理资源
                         try:
                             await stream_ctx.__aexit__(None, None, None)
@@ -212,6 +224,9 @@ async def send_gemini_request(payload: dict, is_streaming: bool = False, credent
                         # 记录API调用错误
                         if credential_manager and current_file:
                             await credential_manager.record_api_call_result(current_file, False, resp.status_code)
+                            # 记录失败，触发熔断
+                            await credential_manager.record_failure(current_file)
+
                         
                         # 清理资源
                         try:
@@ -261,6 +276,7 @@ async def send_gemini_request(payload: dict, is_streaming: bool = False, credent
                         # 如果重试可用且未达到最大次数，继续重试
                         if retry_429_enabled and attempt < max_retries:
                             log.warning(f"[RETRY] 429 error encountered, retrying ({attempt + 1}/{max_retries})")
+
                             if credential_manager:
                                 # 429错误时强制轮换凭证，不增加调用计数
                                 await credential_manager.force_rotate_credential()
@@ -333,6 +349,7 @@ def _handle_streaming_response_managed(resp, stream_ctx, client, credential_mana
             # 记录API调用错误
             if credential_manager and current_file:
                 await credential_manager.record_api_call_result(current_file, False, resp.status_code)
+
             
             await _handle_api_error(credential_manager, resp.status_code, response_content)
             
@@ -354,6 +371,7 @@ def _handle_streaming_response_managed(resp, stream_ctx, client, credential_mana
     # 正常流式响应处理，确保资源在流结束时被清理
     async def managed_stream_generator():
         success_recorded = False
+
         managed_stream_generator._chunk_count = 0  # 初始化chunk计数器
         try:
             async for chunk in resp.aiter_lines():
@@ -473,6 +491,9 @@ async def _handle_non_streaming_response(resp, credential_manager: CredentialMan
         # 记录API调用错误
         if credential_manager and current_file:
             await credential_manager.record_api_call_result(current_file, False, resp.status_code)
+
+            # 记录失败，触发熔断
+            await credential_manager.record_failure(current_file)
         
         await _handle_api_error(credential_manager, resp.status_code, response_content)
         
@@ -532,4 +553,12 @@ def build_gemini_payload_from_native(native_request: dict, model_from_path: str)
     return {
         "model": get_base_model_name(model_from_path),
         "request": request_data
+
+        #可以在这里增加判断是否需要自动切换到 -0605-preview 模型
+
+        #if credential_exceeded_limit:
+        #   return {"model": "-0605-preview",
+        #            "request": request_data}
+
+
     }

@@ -46,6 +46,9 @@ class CredentialManager:
         # 并发控制
         self._state_lock = asyncio.Lock()
         self._operation_lock = asyncio.Lock()
+        # 凭证级别的锁，用于更细粒度的状态更新
+        self._credential_locks: Dict[str, asyncio.Lock] = {}
+
         
         # 工作线程控制
         self._shutdown_event = asyncio.Event()
@@ -272,6 +275,21 @@ class CredentialManager:
                     # 正常模式：使用随机选择
                     selected_credential = await self._select_credential_by_weighted_random()
                     log.debug(f"随机模式选择凭证: {selected_credential}")
+
+
+                # 检查凭证使用次数是否达到限制
+                usage_stats = await self._get_credential_usage_stats()
+                credential_usage = usage_stats.get(selected_credential, 0)
+                daily_limit = await self._get_daily_limit(selected_credential)  # 获取凭证的每日限制
+
+                if credential_usage >= daily_limit:
+                    log.warning(f"凭证 {selected_credential} 已达到每日调用限制 ({credential_usage}/{daily_limit}), 尝试选择其他凭证")
+                    attempted_credentials.add(selected_credential)  # 避免重复尝试
+                    # 重新选择凭证的逻辑，可以参考下面的重试部分
+                    selected_credential = None
+                    #进入重新选择凭证的逻辑
+
+
                     
             except Exception as e:
                 selection_error = e
@@ -378,6 +396,7 @@ class CredentialManager:
         return False
     
     async def force_rotate_credential(self):
+
         """强制选择新凭证（用于429错误处理）"""
         async with self._operation_lock:
             if len(self._credential_files) <= 1:
@@ -386,6 +405,52 @@ class CredentialManager:
             
             # 简单地重新选择一个凭证（随机）
             log.info("Forced credential rotation due to rate limit")
+
+    async def _get_daily_limit(self, credential_name: str) -> int:
+
+        """获取指定凭证的每日限制次数"""
+        try:
+            # 首先尝试获取当前使用的凭证的限制
+            state = await self._storage_adapter.get_credential_state(credential_name)
+            limit = state.get("daily_limit_gemini_2_5_pro")
+
+            if limit is None:
+                stats = await self._storage_adapter.get_usage_stats(credential_name)
+                if stats:
+                    limit = stats.get("daily_limit_gemini_2_5_pro")
+            if limit is not None:
+                return int(limit)
+            else:
+                # 如果没有设置限制，返回一个默认值
+                return 100
+        except Exception as e:
+
+        """获取指定凭证的每日限制次数"""
+        try:
+            # 从状态中获取限制
+            state = await self._storage_adapter.get_credential_state(credential_name)
+            limit = state.get("daily_limit_gemini_2_5_pro")
+
+            if limit is None:
+                stats = await self._storage_adapter.get_usage_stats(credential_name)
+                if stats:
+                    limit = stats.get("daily_limit_gemini_2_5_pro")
+            if limit is not None:
+                return int(limit)
+            else:
+                # 如果没有设置限制，返回一个默认值
+                return 100
+        except Exception as e:
+            log.error(f"获取凭证 {credential_name} 每日限制失败: {e}")
+            # 出现错误时返回默认值
+            return 100
+
+
+
+
+
+
+
     
     async def _get_credential_usage_stats(self) -> Dict[str, int]:
         """获取所有凭证的使用次数统计"""
@@ -508,19 +573,41 @@ class CredentialManager:
     async def increment_credential_usage(self, credential_name: str):
         """增加指定凭证的使用计数"""
         try:
-            current_state = await self._storage_adapter.get_credential_state(credential_name)
-            current_usage = current_state.get("usage_count", 0)
-            
-            await self.update_credential_state(credential_name, {
-                "usage_count": current_usage + 1,
-                "last_used": datetime.now(timezone.utc).isoformat()
-            })
+            # 获取或创建一个凭证特定的锁
+            credential_lock = self._get_credential_lock(credential_name)
+            async with credential_lock:
+                current_state = await self._storage_adapter.get_credential_state(credential_name)
+                current_usage = current_state.get("usage_count", 0)
+
+                new_usage = current_usage + 1
+
+
+                # 使用重试机制
+
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        await self.update_credential_state(credential_name, {
+                            "usage_count": new_usage,
+                            "last_used": datetime.now(timezone.utc).isoformat()
+                        })
+                        break  # 成功后退出循环
+
             
             log.debug(f"凭证 {credential_name} 使用次数增加到: {current_usage + 1}")
             
         except Exception as e:
             log.error(f"更新凭证使用次数失败 {credential_name}: {e}")
     
+    def _get_credential_lock(self, credential_name: str) -> asyncio.Lock:
+        """获取或创建特定于凭证的锁"""
+        if credential_name not in self._credential_locks:
+            # 使用线程安全的方式添加新的锁
+            self._credential_locks[credential_name] = asyncio.Lock()
+        return self._credential_locks[credential_name]
+
+
+
     def increment_call_count(self):
         """增加调用计数 - 此方法现在仅用于兼容性，实际计数在increment_credential_usage中"""
         log.debug(f"API调用完成")  # 仅记录调用，不再维护全局计数
@@ -580,7 +667,7 @@ class CredentialManager:
     async def update_credential_state(self, credential_name: str, state_updates: Dict[str, Any]):
         """更新凭证状态"""
         try:
-            # 直接通过存储适配器更新状态
+
             success = await self._storage_adapter.update_credential_state(credential_name, state_updates)
             
             # 如果是当前使用的凭证，更新缓存
@@ -756,6 +843,7 @@ class CredentialManager:
     async def _refresh_token(self, credential_data: Dict[str, Any], filename: str) -> Optional[Dict[str, Any]]:
         """刷新token并更新存储"""
         try:
+
             # 创建Credentials对象
             creds = Credentials.from_dict(credential_data)
             
@@ -816,6 +904,37 @@ class CredentialManager:
                 
         return False
 
+    # 熔断机制
+    async def record_failure(self, credential_name: str):
+        """记录凭证失败次数，并检查是否需要熔断"""
+        try:
+            state = await self._storage_adapter.get_credential_state(credential_name)
+            failure_count = state.get("failure_count", 0) + 1
+            
+            # 记录失败次数和上次失败时间
+            state_updates = {
+                "failure_count": failure_count,
+                "last_failure_time": time.time()
+            }
+            
+            await self.update_credential_state(credential_name, state_updates)
+            
+            # 检查是否达到熔断阈值
+            max_failures = 5  # 示例阈值
+            ban_duration = 3600  # 示例熔断时长（秒）
+            if failure_count >= max_failures:
+                log.warning(f"凭证 {credential_name} 达到最大失败次数，自动禁用 {ban_duration} 秒")
+                await self.set_cred_disabled(credential_name, True)
+                # 计划在ban_duration秒后自动启用凭证
+                asyncio.create_task(self._auto_enable_credential(credential_name, ban_duration))
+                
+        except Exception as e:
+            log.error(f"记录凭证失败信息失败: {e}")
+    
+    async def _auto_enable_credential(self, credential_name: str, delay: int):
+        """延迟后自动启用凭证"""
+        await asyncio.sleep(delay)
+        await self.set_cred_disabled(credential_name, False)
     # 兼容性方法 - 保持与现有代码的接口兼容
     async def _update_token_in_file(self, file_path: str, new_token: str, expires_at=None):
         """更新凭证令牌（兼容性方法）"""
